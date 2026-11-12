@@ -54,6 +54,11 @@ pub struct WorkspaceTools {
     // so shared state must be lock-guarded, never `&mut`-borrowed.
     files_read: Mutex<HashSet<PathBuf>>,
     bg_jobs: Mutex<shell::BgJobs>,
+    /// Serializes mutating tool ops (write/edit/patch) so concurrent swarm
+    /// tasks never interleave read-modify-write races. Reads stay concurrent.
+    /// Tokio mutex (Send guard): a std guard held across the web/shell awaits
+    /// below would poison the spawned future's Send bound.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl WorkspaceTools {
@@ -71,12 +76,24 @@ impl WorkspaceTools {
             exa_base_url: config.exa_base_url.clone(),
             files_read: Mutex::new(HashSet::new()),
             bg_jobs: Mutex::new(shell::BgJobs::new()),
+            write_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Execute a tool by name with JSON arguments string.
     /// Returns the tool result, clipped to max_observation_chars.
     pub async fn execute(&self, name: &str, args_json: &str) -> ToolResult {
+        // Mutating ops take the write lock for their whole dispatch. The
+        // locked sections are synchronous filesystem calls (no .await while
+        // held), so no executor thread is ever blocked on this mutex.
+        let _write_guard = if matches!(
+            name,
+            "write_file" | "edit_file" | "apply_patch" | "hashline_edit"
+        ) {
+            Some(self.write_lock.lock().await)
+        } else {
+            None
+        };
         let args: serde_json::Value =
             serde_json::from_str(args_json).unwrap_or(serde_json::Value::Object(Default::default()));
 
@@ -145,6 +162,7 @@ impl WorkspaceTools {
                     timeout,
                     self.max_shell_output_chars,
                 )
+                .await
             }
             "run_shell_bg" => {
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");

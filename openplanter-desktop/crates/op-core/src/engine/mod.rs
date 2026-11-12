@@ -168,21 +168,39 @@ pub async fn demo_solve(
     emitter.emit_complete(&response);
 }
 
-/// Rejoin concurrent tool results in call order.
+/// Swarm-timeout placeholder: every tool call must still yield exactly one
+/// Tool message or the model API rejects the turn.
+const SWARM_TIMEOUT_MSG: &str = "[swarm] tool deadline exceeded";
+
+/// One tool result with its measured wall time.
+/// `elapsed_ms: None` marks a synthesized gap (swarm timeout), never a run.
+struct TimedTool {
+    idx: usize,
+    elapsed_ms: Option<u128>,
+    result: ToolResult,
+}
+
+/// Rejoin concurrent tool results in call order, timings attached.
 ///
 /// Every tool call must yield exactly one Tool message, in order, or the
 /// model API rejects the turn. Gaps (swarm timeout) become error results.
-fn order_tool_results(count: usize, done: Vec<(usize, ToolResult)>) -> Vec<ToolResult> {
-    let mut ordered: Vec<Option<ToolResult>> = (0..count).map(|_| None).collect();
-    for (idx, result) in done {
+fn order_tool_results(count: usize, done: Vec<TimedTool>) -> Vec<TimedTool> {
+    let mut ordered: Vec<Option<TimedTool>> = (0..count).map(|_| None).collect();
+    for t in done {
+        let idx = t.idx;
         if idx < count {
-            ordered[idx] = Some(result);
+            ordered[idx] = Some(t);
         }
     }
     ordered
         .into_iter()
-        .map(|r| {
-            r.unwrap_or_else(|| ToolResult::error("[swarm] tool deadline exceeded".to_string()))
+        .enumerate()
+        .map(|(idx, t)| {
+            t.unwrap_or_else(|| TimedTool {
+                idx,
+                elapsed_ms: None,
+                result: ToolResult::error(SWARM_TIMEOUT_MSG.to_string()),
+            })
         })
         .collect()
 }
@@ -362,25 +380,52 @@ pub async fn solve(
         let tool_deadline_ms = (config.command_timeout_sec as u64)
             .saturating_mul(1000)
             .saturating_add(60_000);
-        let mut tool_set: JoinSet<(usize, ToolResult)> = JoinSet::new();
+        let mut tool_set: JoinSet<TimedTool> = JoinSet::new();
         for (idx, tc) in turn.tool_calls.iter().enumerate() {
             let tools = tools.clone();
             let name = tc.name.clone();
             let args = tc.arguments.clone();
             emitter.emit_trace(&format!("Executing tool: {} ({})", tc.name, tc.id));
             tool_set.spawn(async move {
+                let start = std::time::Instant::now();
                 let result = tools.execute(&name, &args).await;
-                (idx, result)
+                TimedTool {
+                    idx,
+                    elapsed_ms: Some(start.elapsed().as_millis()),
+                    result,
+                }
             });
         }
-        let (done, tool_timed_out) =
-            op_swarm::join_with_deadline(&mut tool_set, tool_deadline_ms).await;
+        // Cancel aborts the swarm immediately instead of waiting out timeouts.
+        let cancel_watch = cancel.clone();
+        let (done, tool_timed_out) = tokio::select! {
+            res = op_swarm::join_with_deadline(&mut tool_set, tool_deadline_ms) => res,
+            _ = cancel_watch.cancelled() => {
+                tool_set.abort_all();
+                tools.cleanup();
+                curator_set.abort_all();
+                emitter.emit_error("Cancelled");
+                return;
+            }
+        };
         if tool_timed_out {
             emitter.emit_trace("[tools] swarm deadline reached, missing calls errored");
         }
         let ordered = order_tool_results(turn.tool_calls.len(), done);
 
-        for (tc, result) in turn.tool_calls.iter().zip(ordered) {
+        for (tc, t) in turn.tool_calls.iter().zip(ordered) {
+            match t.elapsed_ms {
+                Some(ms) => emitter.emit_trace(&format!(
+                    "Tool {} finished in {}ms{}",
+                    tc.name,
+                    ms,
+                    if t.result.is_error { " (error)" } else { "" }
+                )),
+                None => emitter.emit_trace(&format!(
+                    "Tool {} hit swarm deadline",
+                    tc.name
+                )),
+            }
             if cancel.is_cancelled() {
                 emitter.emit_error("Cancelled");
                 tools.cleanup();
@@ -388,13 +433,13 @@ pub async fn solve(
                 return;
             }
 
-            if result.is_error {
-                emitter.emit_trace(&format!("Tool {} error: {}", tc.name, &result.content[..result.content.len().min(200)]));
+            if t.result.is_error {
+                emitter.emit_trace(&format!("Tool {} error: {}", tc.name, &t.result.content[..t.result.content.len().min(200)]));
             }
 
             messages.push(Message::Tool {
                 tool_call_id: tc.id.clone(),
-                content: result.content,
+                content: t.result.content,
             });
         }
 
@@ -697,26 +742,33 @@ mod tests {
     #[test]
     fn test_order_tool_results_rejoins_in_call_order() {
         let done = vec![
-            (2, ToolResult::ok("c".into())),
-            (0, ToolResult::ok("a".into())),
-            (1, ToolResult::error("b failed".into())),
+            TimedTool { idx: 2, elapsed_ms: Some(30), result: ToolResult::ok("c".into()) },
+            TimedTool { idx: 0, elapsed_ms: Some(10), result: ToolResult::ok("a".into()) },
+            TimedTool { idx: 1, elapsed_ms: Some(12), result: ToolResult::error("b failed".into()) },
         ];
         let ordered = order_tool_results(3, done);
         assert_eq!(ordered.len(), 3);
-        assert_eq!(ordered[0].content, "a");
-        assert!(ordered[1].is_error);
-        assert_eq!(ordered[2].content, "c");
+        assert_eq!(ordered[0].result.content, "a");
+        assert_eq!(ordered[0].elapsed_ms, Some(10));
+        assert!(ordered[1].result.is_error);
+        assert_eq!(ordered[1].elapsed_ms, Some(12));
+        assert_eq!(ordered[2].result.content, "c");
     }
 
     #[test]
     fn test_order_tool_results_errors_gaps() {
-        let done = vec![(0, ToolResult::ok("a".into()))];
+        let done = vec![
+            TimedTool { idx: 0, elapsed_ms: Some(5), result: ToolResult::ok("a".into()) },
+        ];
         let ordered = order_tool_results(3, done);
         assert_eq!(ordered.len(), 3);
-        assert!(!ordered[0].is_error);
-        assert!(ordered[1].is_error);
-        assert!(ordered[1].content.contains("deadline exceeded"));
-        assert!(ordered[2].is_error);
+        assert!(!ordered[0].result.is_error);
+        assert_eq!(ordered[0].elapsed_ms, Some(5));
+        for t in &ordered[1..] {
+            assert!(t.result.is_error);
+            assert_eq!(t.elapsed_ms, None);
+            assert_eq!(t.result.content, SWARM_TIMEOUT_MSG);
+        }
     }
 
     #[test]

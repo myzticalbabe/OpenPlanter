@@ -80,7 +80,29 @@ impl Drop for BgJobs {
     }
 }
 
-pub fn run_shell(
+/// Async front for the swarm: runs the blocking wait on Tokio's blocking
+/// pool so a long-lived shell call yields the worker thread instead of
+/// parking it (a parked worker silently caps fan-out at the thread count).
+/// Output format is byte-identical to [`run_shell_blocking`].
+pub async fn run_shell(
+    root: &Path,
+    shell: &str,
+    command: &str,
+    timeout_sec: u64,
+    max_output_chars: usize,
+) -> ToolResult {
+    let root = root.to_path_buf();
+    let shell = shell.to_string();
+    let command_owned = command.to_string();
+    let command_for_err = command_owned.clone();
+    tokio::task::spawn_blocking(move || {
+        run_shell_blocking(&root, &shell, &command_owned, timeout_sec, max_output_chars)
+    })
+    .await
+    .unwrap_or_else(|e| ToolResult::error(format!("$ {command_for_err}\n[join error: {e}]")))
+}
+
+pub fn run_shell_blocking(
     root: &Path,
     shell: &str,
     command: &str,
@@ -249,7 +271,7 @@ mod tests {
     #[test]
     fn test_run_shell_basic() {
         let dir = TempDir::new().unwrap();
-        let result = run_shell(dir.path(), "/bin/sh", "echo hello", 10, 16000);
+        let result = run_shell_blocking(dir.path(), "/bin/sh", "echo hello", 10, 16000);
         assert!(!result.is_error);
         assert!(result.content.contains("hello"));
         assert!(result.content.contains("exit_code=0"));
@@ -258,7 +280,7 @@ mod tests {
     #[test]
     fn test_run_shell_heredoc_blocked() {
         let dir = TempDir::new().unwrap();
-        let result = run_shell(
+        let result = run_shell_blocking(
             dir.path(),
             "/bin/sh",
             "cat << EOF\nhello\nEOF",
@@ -272,7 +294,7 @@ mod tests {
     #[test]
     fn test_run_shell_interactive_blocked() {
         let dir = TempDir::new().unwrap();
-        let result = run_shell(dir.path(), "/bin/sh", "vim test.txt", 10, 16000);
+        let result = run_shell_blocking(dir.path(), "/bin/sh", "vim test.txt", 10, 16000);
         assert!(result.is_error);
         assert!(result.content.contains("BLOCKED"));
     }
