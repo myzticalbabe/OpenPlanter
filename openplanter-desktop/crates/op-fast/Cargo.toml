@@ -1,0 +1,29 @@
+[package]
+name = "op-fast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "op_fast"
+path = "src/lib.rs"
+
+[[bin]]
+name = "op-fast"
+path = "src/main.rs"
+
+[dependencies]
+walkdir = "2"
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+crc32fast = "1"
+sha2 = "0.10"
+glob = "0.3"
+rayon = "1.12"
+
+[dev-dependencies]
+tempfile = "3"
