@@ -2455,6 +2455,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "op-swarm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+]
+
+[[package]]
 name = "op-tauri"
 version = "0.1.0"
 dependencies = [
