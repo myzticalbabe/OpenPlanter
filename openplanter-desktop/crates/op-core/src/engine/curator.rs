@@ -148,7 +148,7 @@ pub async fn run_curator(
 
     let provider = model.provider_name().to_string();
     let tool_defs = build_curator_tool_defs(&provider);
-    let mut tools = WorkspaceTools::new(config);
+    let tools = WorkspaceTools::new(config);
 
     let mut messages = vec![
         Message::System {

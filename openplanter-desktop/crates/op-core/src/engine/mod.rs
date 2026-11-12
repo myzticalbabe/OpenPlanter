@@ -7,6 +7,8 @@ pub mod context;
 pub mod curator;
 pub mod judge;
 
+use std::sync::Arc;
+
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -16,7 +18,7 @@ use crate::events::{DeltaEvent, DeltaKind, StepEvent, TokenUsage};
 use crate::model::Message;
 use crate::prompts::build_system_prompt;
 use crate::tools::defs::build_tool_defs;
-use crate::tools::WorkspaceTools;
+use crate::tools::{ToolResult, WorkspaceTools};
 
 use self::curator::{extract_step_context, run_curator, CuratorResult};
 
@@ -166,6 +168,25 @@ pub async fn demo_solve(
     emitter.emit_complete(&response);
 }
 
+/// Rejoin concurrent tool results in call order.
+///
+/// Every tool call must yield exactly one Tool message, in order, or the
+/// model API rejects the turn. Gaps (swarm timeout) become error results.
+fn order_tool_results(count: usize, done: Vec<(usize, ToolResult)>) -> Vec<ToolResult> {
+    let mut ordered: Vec<Option<ToolResult>> = (0..count).map(|_| None).collect();
+    for (idx, result) in done {
+        if idx < count {
+            ordered[idx] = Some(result);
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|r| {
+            r.unwrap_or_else(|| ToolResult::error("[swarm] tool deadline exceeded".to_string()))
+        })
+        .collect()
+}
+
 /// Rough token estimate: ~4 chars per token.
 fn estimate_tokens(messages: &[Message]) -> usize {
     messages
@@ -244,7 +265,8 @@ pub async fn solve(
 
     // 2. Build tools and messages
     let tool_defs = build_tool_defs(&provider);
-    let mut tools = WorkspaceTools::new(config);
+    // Shared across concurrent tool tasks: execute() takes &self.
+    let tools = Arc::new(WorkspaceTools::new(config));
 
     let system_prompt = build_system_prompt(
         config.recursive,
@@ -333,17 +355,38 @@ pub async fn solve(
             return;
         }
 
-        // Execute each tool call and collect results
-        for tc in &turn.tool_calls {
+        // Execute tool calls concurrently via op-swarm, rejoin in call order
+        // so every tool_call_id still gets exactly one Tool message, in order.
+        // Each tool self-bounds via command_timeout_sec; the swarm deadline is
+        // one max-tool-time plus margin, a backstop against hangs past it.
+        let tool_deadline_ms = (config.command_timeout_sec as u64)
+            .saturating_mul(1000)
+            .saturating_add(60_000);
+        let mut tool_set: JoinSet<(usize, ToolResult)> = JoinSet::new();
+        for (idx, tc) in turn.tool_calls.iter().enumerate() {
+            let tools = tools.clone();
+            let name = tc.name.clone();
+            let args = tc.arguments.clone();
+            emitter.emit_trace(&format!("Executing tool: {} ({})", tc.name, tc.id));
+            tool_set.spawn(async move {
+                let result = tools.execute(&name, &args).await;
+                (idx, result)
+            });
+        }
+        let (done, tool_timed_out) =
+            op_swarm::join_with_deadline(&mut tool_set, tool_deadline_ms).await;
+        if tool_timed_out {
+            emitter.emit_trace("[tools] swarm deadline reached, missing calls errored");
+        }
+        let ordered = order_tool_results(turn.tool_calls.len(), done);
+
+        for (tc, result) in turn.tool_calls.iter().zip(ordered) {
             if cancel.is_cancelled() {
                 emitter.emit_error("Cancelled");
                 tools.cleanup();
                 curator_set.abort_all();
                 return;
             }
-
-            emitter.emit_trace(&format!("Executing tool: {} ({})", tc.name, tc.id));
-            let result = tools.execute(&tc.name, &tc.arguments).await;
 
             if result.is_error {
                 emitter.emit_trace(&format!("Tool {} error: {}", tc.name, &result.content[..result.content.len().min(200)]));
@@ -649,6 +692,31 @@ mod tests {
             })
             .unwrap();
         assert!(complete_text.contains("Spawned test"));
+    }
+
+    #[test]
+    fn test_order_tool_results_rejoins_in_call_order() {
+        let done = vec![
+            (2, ToolResult::ok("c".into())),
+            (0, ToolResult::ok("a".into())),
+            (1, ToolResult::error("b failed".into())),
+        ];
+        let ordered = order_tool_results(3, done);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].content, "a");
+        assert!(ordered[1].is_error);
+        assert_eq!(ordered[2].content, "c");
+    }
+
+    #[test]
+    fn test_order_tool_results_errors_gaps() {
+        let done = vec![(0, ToolResult::ok("a".into()))];
+        let ordered = order_tool_results(3, done);
+        assert_eq!(ordered.len(), 3);
+        assert!(!ordered[0].is_error);
+        assert!(ordered[1].is_error);
+        assert!(ordered[1].content.contains("deadline exceeded"));
+        assert!(ordered[2].is_error);
     }
 
     #[test]

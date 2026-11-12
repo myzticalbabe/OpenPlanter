@@ -11,6 +11,7 @@ pub mod patching;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::config::AgentConfig;
 
@@ -49,8 +50,10 @@ pub struct WorkspaceTools {
     max_observation_chars: usize,
     exa_api_key: Option<String>,
     exa_base_url: String,
-    files_read: HashSet<PathBuf>,
-    bg_jobs: shell::BgJobs,
+    // Interior mutability: tool calls fan out concurrently via op-swarm,
+    // so shared state must be lock-guarded, never `&mut`-borrowed.
+    files_read: Mutex<HashSet<PathBuf>>,
+    bg_jobs: Mutex<shell::BgJobs>,
 }
 
 impl WorkspaceTools {
@@ -66,14 +69,14 @@ impl WorkspaceTools {
             max_observation_chars: config.max_observation_chars as usize,
             exa_api_key: config.exa_api_key.clone(),
             exa_base_url: config.exa_base_url.clone(),
-            files_read: HashSet::new(),
-            bg_jobs: shell::BgJobs::new(),
+            files_read: Mutex::new(HashSet::new()),
+            bg_jobs: Mutex::new(shell::BgJobs::new()),
         }
     }
 
     /// Execute a tool by name with JSON arguments string.
     /// Returns the tool result, clipped to max_observation_chars.
-    pub async fn execute(&mut self, name: &str, args_json: &str) -> ToolResult {
+    pub async fn execute(&self, name: &str, args_json: &str) -> ToolResult {
         let args: serde_json::Value =
             serde_json::from_str(args_json).unwrap_or(serde_json::Value::Object(Default::default()));
 
@@ -87,13 +90,13 @@ impl WorkspaceTools {
                     path,
                     hashline,
                     self.max_file_chars,
-                    &mut self.files_read,
+                    &mut self.files_read.lock().unwrap(),
                 )
             }
             "write_file" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                filesystem::write_file(&self.root, path, content, &mut self.files_read)
+                filesystem::write_file(&self.root, path, content, &mut self.files_read.lock().unwrap())
             }
             "edit_file" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -104,7 +107,7 @@ impl WorkspaceTools {
                     path,
                     old_text,
                     new_text,
-                    &mut self.files_read,
+                    &mut self.files_read.lock().unwrap(),
                 )
             }
             "list_files" => {
@@ -149,16 +152,16 @@ impl WorkspaceTools {
                     &self.root,
                     &self.shell_path,
                     command,
-                    &mut self.bg_jobs,
+                    &mut self.bg_jobs.lock().unwrap(),
                 )
             }
             "check_shell_bg" => {
                 let job_id = args.get("job_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                shell::check_shell_bg(job_id, &mut self.bg_jobs, self.max_shell_output_chars)
+                shell::check_shell_bg(job_id, &mut self.bg_jobs.lock().unwrap(), self.max_shell_output_chars)
             }
             "kill_shell_bg" => {
                 let job_id = args.get("job_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                shell::kill_shell_bg(job_id, &mut self.bg_jobs)
+                shell::kill_shell_bg(job_id, &mut self.bg_jobs.lock().unwrap())
             }
 
             // Web
@@ -200,7 +203,7 @@ impl WorkspaceTools {
             // Patching
             "apply_patch" => {
                 let patch = args.get("patch").and_then(|v| v.as_str()).unwrap_or("");
-                patching::apply_patch(&self.root, patch, &mut self.files_read)
+                patching::apply_patch(&self.root, patch, &mut self.files_read.lock().unwrap())
             }
             "hashline_edit" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -209,7 +212,7 @@ impl WorkspaceTools {
                     .and_then(|v| v.as_array())
                     .cloned()
                     .unwrap_or_default();
-                patching::hashline_edit(&self.root, path, &edits, &mut self.files_read)
+                patching::hashline_edit(&self.root, path, &edits, &mut self.files_read.lock().unwrap())
             }
 
             // Meta
@@ -237,7 +240,7 @@ impl WorkspaceTools {
     }
 
     /// Clean up background jobs on shutdown.
-    pub fn cleanup(&mut self) {
-        self.bg_jobs.cleanup();
+    pub fn cleanup(&self) {
+        self.bg_jobs.lock().unwrap().cleanup();
     }
 }
