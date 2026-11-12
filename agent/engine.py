@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -17,6 +18,11 @@ from .prompts import build_system_prompt
 from .replay_log import ReplayLogger
 from .tool_defs import get_tool_definitions
 from .tools import WorkspaceTools
+
+try:
+    from . import swarm_fast as _swarm_fast
+except ImportError:  # pragma: no cover - shim is part of the repo
+    _swarm_fast = None  # type: ignore[assignment]
 
 EventCallback = Callable[[str], None]
 StepCallback = Callable[[dict[str, Any]], None]
@@ -516,24 +522,61 @@ class RLMEngine:
                 end_group = getattr(self.tools, "end_parallel_write_group", None)
                 if callable(begin_group):
                     begin_group(group_id)
+                ran_via_swarm = False
                 try:
-                    with ThreadPoolExecutor(max_workers=len(parallel)) as pool:
-                        futures = {
-                            pool.submit(
-                                self._run_one_tool,
-                                tc=tc, depth=depth, step=step, objective=objective,
-                                context=context, on_event=on_event, on_step=on_step,
-                                deadline=deadline, current_model=model,
-                                replay_logger=replay_logger,
-                                parallel_group_id=group_id,
-                                parallel_owner=f"{tc.id or 'tc'}:{idx}",
-                            ): idx
-                            for idx, tc in parallel
-                        }
-                        for future in futures:
-                            idx = futures[future]
-                            result_entry, is_final_entry = future.result()
-                            indexed_results[idx] = (result_entry, is_final_entry)
+                    # Swarm fast path: asyncio deadline + partials, tools on
+                    # threads via to_thread. Falls back to ThreadPoolExecutor
+                    # when the shim is missing, a loop is already running,
+                    # or the gather itself fails.
+                    swarm_ms: int | None = None
+                    if deadline:
+                        swarm_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                    try:
+                        _running = asyncio.get_running_loop()
+                    except RuntimeError:
+                        _running = None
+                    if _swarm_fast is not None and swarm_ms is not None and _running is None:
+                        async def _gather_swarm() -> list:
+                            async def _one(idx: int, tc: ToolCall) -> tuple:
+                                res = await asyncio.to_thread(
+                                    self._run_one_tool,
+                                    tc=tc, depth=depth, step=step, objective=objective,
+                                    context=context, on_event=on_event, on_step=on_step,
+                                    deadline=deadline, current_model=model,
+                                    replay_logger=replay_logger,
+                                    parallel_group_id=group_id,
+                                    parallel_owner=f"{tc.id or 'tc'}:{idx}",
+                                )
+                                return idx, res
+                            got, _swarm_timed_out = await _swarm_fast.join_with_deadline(
+                                [_one(idx, tc) for idx, tc in parallel], swarm_ms)
+                            return got
+                        try:
+                            gathered = asyncio.run(_gather_swarm())
+                        except Exception:
+                            gathered = None
+                        if gathered is not None:
+                            for idx, (result_entry, is_final_entry) in gathered:
+                                indexed_results[idx] = (result_entry, is_final_entry)
+                            ran_via_swarm = True
+                    if not ran_via_swarm:
+                        with ThreadPoolExecutor(max_workers=len(parallel)) as pool:
+                            futures = {
+                                pool.submit(
+                                    self._run_one_tool,
+                                    tc=tc, depth=depth, step=step, objective=objective,
+                                    context=context, on_event=on_event, on_step=on_step,
+                                    deadline=deadline, current_model=model,
+                                    replay_logger=replay_logger,
+                                    parallel_group_id=group_id,
+                                    parallel_owner=f"{tc.id or 'tc'}:{idx}",
+                                ): idx
+                                for idx, tc in parallel
+                            }
+                            for future in futures:
+                                idx = futures[future]
+                                result_entry, is_final_entry = future.result()
+                                indexed_results[idx] = (result_entry, is_final_entry)
                 finally:
                     if callable(end_group):
                         end_group(group_id)

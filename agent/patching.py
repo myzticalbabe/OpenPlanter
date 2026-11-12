@@ -193,10 +193,41 @@ def _render_lines(lines: list[str], prefer_trailing_newline: bool) -> str:
     return text
 
 
+def precheck_patch(patch_text: str) -> None:
+    """Fast marker pre-check via the `op-fast` binary; no-op when absent.
+
+    Raises PatchApplyError on definite marker violations before the full
+    parse runs. The Python parser stays canonical for op extraction.
+    """
+    try:
+        from . import op_fast as _op_fast
+    except ImportError:
+        return
+    if _op_fast.find_bin() is None:
+        return
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".patch", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(patch_text)
+        tmp = f.name
+    try:
+        res = _op_fast.patch_check(tmp)
+    finally:
+        try:
+            Path(tmp).unlink()
+        except OSError:
+            pass
+    if res is not None and not res[0]:
+        raise PatchApplyError(res[1])
+
+
 def apply_agent_patch(
     patch_text: str,
     resolve_path: ResolvePathFn,
 ) -> ApplyReport:
+    precheck_patch(patch_text)
     ops = parse_agent_patch(patch_text)
     report = ApplyReport()
 

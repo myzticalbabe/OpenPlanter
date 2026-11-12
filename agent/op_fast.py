@@ -16,9 +16,11 @@ _BIN_NAMES = ("op-fast", "op-fast.exe")
 
 def find_bin() -> Path | None:
     here = Path(__file__).resolve()
-    # agent/ -> openplanter/ -> openplanter-desktop/target/{debug,release}
+    # agent/ -> openplanter/ -> openplanter-desktop/target/{release,debug}
+    # Release first: the debug binary is unoptimized (measured ~6x slower
+    # on fingerprint workloads) and must never win when both exist.
     for base in (here.parent.parent / "openplanter-desktop" / "target",):
-        for profile in ("debug", "release"):
+        for profile in ("release", "debug"):
             for name in _BIN_NAMES:
                 cand = base / profile / name
                 if cand.is_file():

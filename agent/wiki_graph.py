@@ -69,6 +69,30 @@ def _category_slug(display_name: str) -> str:
     return display_name.strip().lower().replace(" & ", "-").replace(" ", "-")
 
 
+def scan_wiki_fast(wiki_dir: Path) -> list[WikiEntry] | None:
+    """Rust fast path: `op-fast wiki-scan` over all *.md index rows.
+
+    Returns None when the binary is absent so callers keep `parse_index`.
+    Row categories are slugified like `parse_index` does.
+    """
+    try:
+        from . import op_fast as _op_fast
+    except ImportError:
+        return None
+    rows = _op_fast.wiki_scan(wiki_dir)
+    if rows is None:
+        return None
+    return [
+        WikiEntry(
+            name=r.get("name", ""),
+            category=_category_slug(r.get("category", "")),
+            rel_path=r.get("path", ""),
+        )
+        for r in rows
+        if r.get("name") and r.get("path")
+    ]
+
+
 def parse_index(wiki_dir: Path) -> list[WikiEntry]:
     """Parse wiki/index.md and return entries with name, category, path."""
     index_path = wiki_dir / "index.md"

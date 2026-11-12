@@ -1,0 +1,50 @@
+name: fast-paths
+# Gates for the Rust/Go upgrade wave: op-fast crate + Python shims.
+# Runs the offline-capable subset only (no model keys, no live runs).
+
+on:
+  push:
+    paths:
+      - "agent/**"
+      - "tests/test_op_fast.py"
+      - "tests/test_fast_cutover.py"
+      - "tests/test_board_fast.py"
+      - "tests/test_patching*.py"
+      - "openplanter-desktop/crates/op-fast/**"
+      - ".github/workflows/fast-paths.yml"
+  pull_request:
+    paths:
+      - "agent/**"
+      - "tests/test_op_fast.py"
+      - "tests/test_fast_cutover.py"
+      - "tests/test_board_fast.py"
+      - "tests/test_patching*.py"
+      - "openplanter-desktop/crates/op-fast/**"
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: openplanter-desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p op-fast --locked
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . pytest
+      - run: >-
+          cargo build -p op-fast --release --manifest-path
+          openplanter-desktop/Cargo.toml
+      - run: >-
+          python -m pytest tests/test_op_fast.py tests/test_fast_cutover.py
+          tests/test_board_fast.py tests/test_patching.py
+          tests/test_patching_complex.py -q

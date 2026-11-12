@@ -30,6 +30,11 @@ from .patching import (
     parse_agent_patch,
 )
 
+try:
+    from . import op_fast as _op_fast
+except ImportError:  # pragma: no cover - shim is part of the repo
+    _op_fast = None  # type: ignore[assignment]
+
 _WS_RE = _re.compile(r"\s+")
 _HASHLINE_PREFIX_RE = _re.compile(r"^\d+:[0-9a-f]{2}\|")
 _HEREDOC_RE = _re.compile(r"<<-?\s*['\"]?\w+['\"]?")
@@ -263,8 +268,33 @@ class WorkspaceTools:
 
     def list_files(self, glob: str | None = None) -> str:
         lines: list[str]
+        if _op_fast is not None:
+            # Rust fast path first: walkdir + same glob rule, no subprocess.
+            try:
+                fast = _op_fast.list_files(self.root, glob)
+            except Exception:
+                fast = None
+            if fast is not None:
+                lines = fast
+                if not lines:
+                    return "(no files)"
+                clipped = lines[: self.max_files_listed]
+                suffix = ""
+                if len(lines) > len(clipped):
+                    suffix = f"\n...[omitted {len(lines) - len(clipped)} files]..."
+                return "\n".join(clipped) + suffix
         if shutil.which("rg"):
-            cmd = ["rg", "--files", "--hidden", "-g", "!.git"]
+            # --no-ignore is load-bearing, not tidiness. ripgrep walks UP from cwd and
+            # applies any enclosing repo's ignore files, and the workspace root here is
+            # not necessarily a repo while its parent can be. Measured on a real corpus
+            # inside C:\Users\clint (which is a git repo with a .gitignore covering it):
+            # without this flag `rg --files` reported 12 of 287 files and `-g 'BCC_*'`
+            # reported 0 of 20 -- so list_files answered "(no files)" as a FACT about a
+            # workspace that was 96% invisible. That is a silent false negative, the one
+            # failure mode an investigation agent cannot detect or recover from. The
+            # workspace root is the authority on what is in the workspace, never a
+            # parent directory's ignore file.
+            cmd = ["rg", "--files", "--hidden", "--no-ignore", "-g", "!.git"]
             if glob:
                 cmd.extend(["-g", glob])
             try:
@@ -292,6 +322,17 @@ class WorkspaceTools:
                     rel = full.relative_to(self.root).as_posix()
                     all_paths.append(rel)
             lines = sorted(all_paths)
+            # The os.walk fallback used to drop `glob` entirely, so the same call
+            # returned every file when ripgrep was missing and a filtered set when it
+            # was present -- a result that depended on an unrelated machine detail.
+            # Apply ripgrep's own rule: a glob containing "/" matches the path relative
+            # to the root, otherwise it matches the basename at any depth.
+            if glob:
+                pat = glob
+                if "/" in pat:
+                    lines = [p for p in lines if fnmatch.fnmatch(p, pat)]
+                else:
+                    lines = [p for p in lines if fnmatch.fnmatch(p.rsplit("/", 1)[-1], pat)]
 
         if not lines:
             return "(no files)"
@@ -304,8 +345,25 @@ class WorkspaceTools:
     def search_files(self, query: str, glob: str | None = None) -> str:
         if not query.strip():
             return "query cannot be empty"
+        if _op_fast is not None:
+            # Rust fast path first: walkdir + substring scan, rg-style hits.
+            try:
+                fast = _op_fast.search_files(
+                    self.root, query, glob, self.max_search_hits)
+            except Exception:
+                fast = None
+            if fast is not None:
+                if not fast:
+                    return "(no matches)"
+                clipped = fast[: self.max_search_hits]
+                suffix = ""
+                if len(fast) > len(clipped):
+                    suffix = f"\n...[omitted {len(fast) - len(clipped)} matches]..."
+                return "\n".join(clipped) + suffix
         if shutil.which("rg"):
-            cmd = ["rg", "-n", "--hidden", "-S", query, "."]
+            # --no-ignore for the same reason as list_files: an enclosing repo's ignore
+            # file must not decide which of the workspace's own files are searchable.
+            cmd = ["rg", "-n", "--hidden", "--no-ignore", "-S", query, "."]
             if glob:
                 cmd.extend(["-g", glob])
             try:
